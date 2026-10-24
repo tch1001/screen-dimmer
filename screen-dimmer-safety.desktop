@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Screen Dimmer Safety Shortcut
+Comment=Double-press Alt to restore screen brightness
+Exec=dimmer-safety
+Terminal=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

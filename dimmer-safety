@@ -1,0 +1,143 @@
+#!/usr/bin/python3
+
+"""Restore XRandR brightness when either Alt key is pressed twice quickly."""
+
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+DOUBLE_PRESS_SECONDS = 0.45
+RESET_PATH = "/org/screendimmer/Safety"
+RESET_INTERFACE = "org.screendimmer.Safety"
+
+
+class DoubleAlt:
+    """Recognize two separate Alt presses, ignoring repeats and Alt shortcuts."""
+
+    def __init__(self, keycodes):
+        self.keycodes = keycodes
+        self.held = set()
+        self.last_press = None
+
+    def feed(self, event, keycode, now):
+        if event not in ("RawKeyPress", "RawKeyRelease"):
+            return False
+        if keycode not in self.keycodes:
+            if event == "RawKeyPress":
+                self.last_press = None
+            return False
+        if event == "RawKeyRelease":
+            self.held.discard(keycode)
+            return False
+        if keycode in self.held:
+            return False
+        already_held = bool(self.held)
+        self.held.add(keycode)
+        if already_held:
+            self.last_press = None
+            return False
+        if self.last_press is not None and now - self.last_press <= DOUBLE_PRESS_SECONDS:
+            self.last_press = None
+            return True
+        self.last_press = now
+        return False
+
+
+def alt_keycodes() -> set[int]:
+    output = subprocess.check_output(("xmodmap", "-pk"), text=True)
+    return {
+        int(match.group(1))
+        for line in output.splitlines()
+        if "Alt_L" in line or "Alt_R" in line
+        if (match := re.match(r"\s*(\d+)", line))
+    }
+
+
+def restore_brightness() -> None:
+    state = subprocess.check_output(("xrandr", "--query"), text=True)
+    failed = False
+    for line in state.splitlines():
+        match = re.match(r"^(\S+) connected(?: primary)? \d+x\d+[+-]\d+[+-]\d+", line)
+        if match:
+            result = subprocess.run(
+                ("xrandr", "--output", match.group(1), "--brightness", "1.0"),
+                check=False,
+            )
+            failed = failed or result.returncode != 0
+    if failed:
+        raise RuntimeError("could not restore every display")
+    # Restoring brightness works even if the indicator or session bus is absent.
+    try:
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        bus.emit_signal(None, RESET_PATH, RESET_INTERFACE, "BrightnessRestored", None)
+        bus.flush_sync(None)
+    except Exception as error:
+        print(f"Brightness restored, but could not notify the indicator: {error}", file=sys.stderr)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reset", action="store_true", help="Restore brightness and reset the indicator now")
+    args = parser.parse_args()
+    if args.reset:
+        restore_brightness()
+        return
+
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    lock = (runtime / "screen-dimmer-safety.lock").open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Screen Dimmer safety is already running.")
+        return
+    keycodes = alt_keycodes()
+    keyboard = subprocess.check_output(
+        ("xinput", "--list", "--id-only", "Virtual core keyboard"), text=True,
+    ).strip()
+    if not keyboard.isdigit():
+        raise RuntimeError("could not identify the X11 master keyboard")
+    process = subprocess.Popen(
+        ("stdbuf", "-oL", "xinput", "test-xi2", "--root", keyboard),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+
+    def stop(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    detector = DoubleAlt(keycodes)
+    event = ""
+    try:
+        for line in process.stdout:
+            match = re.match(r"EVENT type \d+ \((\w+)\)", line)
+            if match:
+                event = match.group(1)
+                continue
+            match = re.match(r"\s*detail:\s*(\d+)", line)
+            if match and detector.feed(event, int(match.group(1)), time.monotonic()):
+                try:
+                    restore_brightness()
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    print(f"Screen Dimmer reset failed: {error}", file=sys.stderr)
+        raise RuntimeError("keyboard listener exited")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
+
+
+if __name__ == "__main__":
+    main()

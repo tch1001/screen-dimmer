@@ -1,0 +1,187 @@
+#!/usr/bin/python3
+
+"""GNOME top-bar control for the Linux screen dimmer."""
+
+import fcntl
+import os
+import re
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import Gio, GLib, Gtk
+
+
+APP_ID = "screen-dimmer"
+LEVELS = (10, 25, 50, 70, 80)
+
+
+class DimmerIndicator:
+    def __init__(self) -> None:
+        self._lock = self._take_lock()
+        self._original = self._read_outputs()
+        self._active_opacity = 0
+        self._syncing_menu = False
+
+        self.indicator = AppIndicator.Indicator.new(
+            APP_ID,
+            "display-brightness-symbolic",
+            AppIndicator.IndicatorCategory.SYSTEM_SERVICES,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("Screen Dimmer")
+        self.indicator.set_label("Off", "80%")
+        self.indicator.set_menu(self._build_menu())
+
+        self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self._reset_subscription = self._bus.signal_subscribe(
+            None, "org.screendimmer.Safety", "BrightnessRestored",
+            "/org/screendimmer/Safety", None, Gio.DBusSignalFlags.NONE,
+            self._brightness_restored,
+        )
+
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._quit)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
+
+    @staticmethod
+    def _take_lock():
+        runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+        lock = (runtime_dir / "screen-dimmer-indicator.lock").open("w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("Screen Dimmer is already running.")
+        return lock
+
+    @staticmethod
+    def _xrandr(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ("xrandr", *args),
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError as error:
+            raise RuntimeError("xrandr is not installed") from error
+        except subprocess.CalledProcessError as error:
+            message = error.stderr.strip() or "xrandr failed"
+            raise RuntimeError(message) from error
+        return result.stdout
+
+    def _read_outputs(self) -> dict[str, str]:
+        state = self._xrandr("--verbose")
+        outputs: dict[str, str] = {}
+        current = None
+        for line in state.splitlines():
+            match = re.match(r"^(\S+) connected(?:\s|$)", line)
+            if match:
+                current = match.group(1)
+                continue
+            if re.match(r"^\S+ disconnected(?:\s|$)", line):
+                current = None
+                continue
+            match = re.match(r"^\s*Brightness:\s*([0-9.]+)", line)
+            if current and match:
+                outputs[current] = match.group(1)
+                current = None
+        if not outputs:
+            raise RuntimeError("no connected displays were found")
+        return outputs
+
+    def _build_menu(self) -> Gtk.Menu:
+        menu = Gtk.Menu()
+
+        title = Gtk.MenuItem(label="Screen Dimmer")
+        title.set_sensitive(False)
+        menu.append(title)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        group = None
+        off = Gtk.RadioMenuItem.new_with_label(group, "Off")
+        self._off_item = off
+        group = off.get_group()
+        off.connect("toggled", self._choose_level, 0)
+        off.set_active(True)
+        menu.append(off)
+
+        for level in LEVELS:
+            item = Gtk.RadioMenuItem.new_with_label(group, f"{level}% dim")
+            item.connect("toggled", self._choose_level, level)
+            menu.append(item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._quit)
+        menu.append(quit_item)
+        menu.show_all()
+        return menu
+
+    def _choose_level(self, item: Gtk.RadioMenuItem, opacity: int) -> None:
+        if self._syncing_menu or not item.get_active():
+            return
+        try:
+            if opacity == 0:
+                self._restore()
+            else:
+                factor = f"{(100 - opacity) / 100:.2f}"
+                for output in self._original:
+                    self._xrandr("--output", output, "--brightness", factor)
+                self._active_opacity = opacity
+            self.indicator.set_label("Off" if opacity == 0 else f"{opacity}%", "80%")
+        except RuntimeError as error:
+            print(f"Screen Dimmer: {error}", file=sys.stderr)
+
+    def _brightness_restored(self, *_args) -> None:
+        # The rescue helper has already restored the display. Updating the radio
+        # item must not write an old brightness snapshot back over that reset.
+        self._active_opacity = 0
+        self._syncing_menu = True
+        try:
+            self._off_item.set_active(True)
+            self.indicator.set_label("Off", "80%")
+        finally:
+            self._syncing_menu = False
+
+    def _restore(self) -> None:
+        if self._active_opacity == 0:
+            return
+        for output, brightness in self._original.items():
+            try:
+                self._xrandr("--output", output, "--brightness", brightness)
+            except RuntimeError as error:
+                print(f"Screen Dimmer: could not restore {output}: {error}", file=sys.stderr)
+        self._active_opacity = 0
+
+    def _quit(self, *_args) -> bool:
+        self._restore()
+        self._bus.signal_unsubscribe(self._reset_subscription)
+        Gtk.main_quit()
+        return GLib.SOURCE_REMOVE
+
+    def run(self) -> None:
+        Gtk.main()
+
+
+def main() -> int:
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        print("Screen Dimmer requires an X11 session.", file=sys.stderr)
+        return 1
+    try:
+        app = DimmerIndicator()
+    except RuntimeError as error:
+        print(f"Screen Dimmer: {error}", file=sys.stderr)
+        return 1
+    app.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

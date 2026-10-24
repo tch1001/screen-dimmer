@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -eu
+
+if [[ "${1:-}" == "--verbose" ]]; then
+    cat <<'EOF'
+eDP-1 connected primary 1920x1080+0+0
+    Brightness: 0.80
+HDMI-1 connected 1920x1080+1920+0
+    Brightness: 1.00
+DP-1 disconnected
+EOF
+else
+    printf '%s\n' "$*" >>"$MOCK_XRANDR_LOG"
+fi

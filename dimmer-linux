@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+
+set -u
+
+readonly PROGRAM_NAME="${0##*/}"
+declare -a outputs=()
+declare -a original_brightness=()
+declare -a changed_outputs=()
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM_NAME [opacity] [--output NAME]
+
+Dim one or all connected displays on an X11 desktop.
+
+  opacity        Dimming level from 1 (barely dim) to 95 (nearly black).
+                 Default: 50
+  -o, --output   Dim only the named XRandR output (for example, HDMI-1).
+  -h, --help     Show this help.
+
+The original brightness is restored when the program exits. Press Ctrl+C to
+stop dimming.
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 1
+}
+
+restore() {
+    local i output
+    trap - EXIT INT TERM HUP
+    for ((i = ${#changed_outputs[@]} - 1; i >= 0; i--)); do
+        output="${changed_outputs[$i]}"
+        xrandr --output "$output" --brightness "${original_brightness[$i]}" >/dev/null 2>&1 || true
+    done
+}
+
+opacity=50
+selected_output=""
+opacity_seen=false
+
+while (($#)); do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -o|--output)
+            (($# >= 2)) || die "$1 requires an output name."
+            selected_output="$2"
+            shift 2
+            ;;
+        --output=*)
+            selected_output="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*|*[!0-9]*)
+            die "opacity must be an integer from 1 to 95."
+            ;;
+        *)
+            $opacity_seen && die "only one opacity value may be supplied."
+            opacity="$1"
+            opacity_seen=true
+            shift
+            ;;
+    esac
+done
+
+(($# == 0)) || die "unexpected argument: $1"
+((opacity >= 1 && opacity <= 95)) || die "opacity must be an integer from 1 to 95."
+
+command -v xrandr >/dev/null 2>&1 || die "xrandr is required. Install the x11-xserver-utils package."
+
+if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+    die "this version uses XRandR and requires an X11 session. Log out, choose 'Ubuntu on Xorg' from the login-screen gear menu, and sign in again."
+fi
+
+[[ -n "${DISPLAY:-}" ]] || die "DISPLAY is not set. Run this command from a terminal inside your graphical desktop."
+
+xrandr_state="$(xrandr --verbose 2>/dev/null)" || die "could not query the X11 display."
+
+while IFS=$'\t' read -r output brightness; do
+    [[ -n "$output" ]] || continue
+    if [[ -z "$selected_output" || "$output" == "$selected_output" ]]; then
+        outputs+=("$output")
+        original_brightness+=("$brightness")
+    fi
+done < <(
+    awk '
+        /^[^[:space:]]+ connected([[:space:]]|$)/ { output=$1; connected=1; next }
+        /^[^[:space:]]+ disconnected([[:space:]]|$)/ { connected=0; next }
+        connected && /^[[:space:]]*Brightness:/ {
+            print output "\t" $2
+            connected=0
+        }
+    ' <<<"$xrandr_state"
+)
+
+((${#outputs[@]} > 0)) || {
+    if [[ -n "$selected_output" ]]; then
+        die "output '$selected_output' is not connected."
+    fi
+    die "no connected outputs were found."
+}
+
+dim_factor="$(awk -v opacity="$opacity" 'BEGIN { printf "%.2f", (100 - opacity) / 100 }')"
+
+trap restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+for ((i = 0; i < ${#outputs[@]}; i++)); do
+    output="${outputs[$i]}"
+    if ! xrandr --output "$output" --brightness "$dim_factor"; then
+        die "could not dim output '$output'."
+    fi
+    changed_outputs+=("$output")
+done
+
+printf 'Dimmed %s to %d%% opacity. Press Ctrl+C to restore brightness.\n' \
+    "$(IFS=,; printf '%s' "${outputs[*]}")" "$opacity"
+
+while :; do
+    sleep 86400 &
+    wait $! || true
+done
